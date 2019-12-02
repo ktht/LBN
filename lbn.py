@@ -64,6 +64,14 @@ class LBN(object):
     *True*, particle (rest frame) weights are clipped at *epsilon*, or at the passed value if it is
     not a boolean. Note that the abs operation is applied before clipping.
 
+    When the number of features per input particle is larger than four, the subsequent values are
+    interpreted as auxiliary features. Similar to the combined particles and restframes, these
+    features are subject to linear combinations to create new, embedded representations. The number
+    number of combinations, *n_auxiliaries*, defaults to the number of boosted output particles.
+    Their features are concatenated to the vector of output features. The weight tensor
+    *aux_weights* is used to create the combined feautres. When given, it should have the
+    shape *(n_in * (n_dim - 4)) x n_auxiliaries*
+
     Instances of this class store most of the intermediate tensors (such as inputs, combinations
     weights, boosted particles, boost matrices, raw features, etc) for later inspection. Note that
     most of these tensors are set after :py:meth:`build` (or the :py:meth:`__call__` shorthand as
@@ -75,10 +83,11 @@ class LBN(object):
     PRODUCT = "product"
     COMBINATIONS = "combinations"
 
-    def __init__(self, n_particles, n_restframes=None, boost_mode=PAIRS, feature_factory=None,
-            particle_weights=None, abs_particle_weights=True, clip_particle_weights=False,
-            restframe_weights=None, abs_restframe_weights=True, clip_restframe_weights=False,
-            weight_init=None, epsilon=1e-5, name=None):
+    def __init__(self, n_particles, n_restframes=None, n_auxiliaries=None, boost_mode=PAIRS,
+             feature_factory=None, particle_weights=None, abs_particle_weights=True,
+             clip_particle_weights=False, restframe_weights=None, abs_restframe_weights=True,
+             clip_restframe_weights=False, aux_weights=None, weight_init=None, epsilon=1e-5,
+             name=None):
         super(LBN, self).__init__()
 
         # determine the number of output particles, which depends on the boost mode
@@ -104,6 +113,7 @@ class LBN(object):
         self.boost_mode = boost_mode
         self.n_particles = n_particles
         self.n_restframes = n_restframes
+        self.n_auxiliaries = n_auxiliaries or self.n_out
 
         # particle weights and settings
         self.particle_weights = particle_weights
@@ -117,6 +127,9 @@ class LBN(object):
         self.clip_restframe_weights = clip_restframe_weights
         self.final_restframe_weights = None
 
+        # auxiliary weights
+        self.aux_weights = aux_weights
+
         # custom weight init parameters in a tuple (mean, stddev)
         self.weight_init = weight_init
 
@@ -128,7 +141,8 @@ class LBN(object):
 
         # sizes that are set during build
         self.n_in = None  # number of input particles
-        self.n_dim = None  # size per input vector, must be four
+        self.n_dim = None  # size per input vector, must be four or higher
+        self.n_aux = None  # size of auxiliary features per input vector (n_dim - 4)
 
         # constants
         self.I = None  # the I matrix
@@ -142,6 +156,7 @@ class LBN(object):
         self.inputs_px = None  # px column of inputs
         self.inputs_py = None  # py column of inputs
         self.inputs_pz = None  # pz column of inputs
+        self.inputs_aux = None  # auxiliary columns of inputs
 
         # tensors of particle combinations
         self.particles_E = None  # energy column of combined particles
@@ -167,6 +182,9 @@ class LBN(object):
 
         # intermediate features
         self._raw_features = None  # raw features before batch normalization, etc
+
+        # auxiliary features with shape (batch, n_in * n_aux, n_auxiliaries)
+        self.aux_features = None
 
         # final output features
         self.features = None
@@ -250,10 +268,13 @@ class LBN(object):
         # setup variables
         with tf.name_scope(self.name):
             with tf.name_scope("variables"):
-                self.setup_variable("particle", self.n_particles)
+                self.setup_variable("particle", (self.n_in, self.n_particles))
 
                 if self.boost_mode != self.COMBINATIONS:
-                    self.setup_variable("restframe", self.n_restframes)
+                    self.setup_variable("restframe", (self.n_in, self.n_restframes))
+
+                if self.n_aux > 0:
+                    self.setup_variable("aux", (self.n_in * self.n_aux, self.n_auxiliaries))
 
         # wrap op setup in a function to be able to wrap into tf.function when requested
         def build_ops(inputs):
@@ -272,6 +293,11 @@ class LBN(object):
                     with tf.name_scope("restframes"):
                         self.build_combinations("restframe")
 
+                # auxiliary features
+                if self.n_aux > 0:
+                    with tf.name_scope("auxiliary"):
+                        self.build_auxiliary()
+
                 with tf.name_scope("boost"):
                     self.build_boost()
 
@@ -289,38 +315,34 @@ class LBN(object):
         """
         Infers sizes based on the (dynamic) shape of the input tensor.
         """
-        # inputs are expected to be four-vectors with the shape (batch, n_in, 4)
-        # convert them in case they have the shape (batch, 4 * n_in)
-        if len(inputs.shape) == 2 and inputs.shape[-1] % 4 == 0:
-            inputs = tf.reshape(inputs, (-1, inputs.shape[-1] // 4, 4))
-
         # infer sizes
         self.n_in = int(inputs.shape[1])
         self.n_dim = int(inputs.shape[2])
-        if self.n_dim != 4:
-            raise Exception("input dimension must be 4 to represent 4-vectors")
+        if self.n_dim < 4:
+            raise Exception("input dimension must be at least 4")
+        self.n_aux = self.n_dim - 4
 
-    def setup_variable(self, prefix, m):
+    def setup_variable(self, prefix, shape):
         """
         Sets up the variable tensors representing linear coefficients for the combinations of
-        particles and rest frames. *prefix* must either be ``"particle"`` or ``"restframe"``, and
-        *m* is the corresponding number of combinations.
+        particles and rest frames. *prefix* must either be ``"particle"``, ``"restframe"`` or
+        ``"aux"``, and *shape* is the corresponding variable tensor shape.
         """
-        if prefix not in ("particle", "restframe"):
-            raise ValueError("unknown prefix '{}'".format(prefix))
+        if prefix not in ("particle", "restframe", "aux"):
+            raise ValueError("unknown weight prefix '{}'".format(prefix))
 
-        weight_name = "{}_weights".format(prefix)
-        weight_shape = (self.n_in, m)
+        name = "{}_weights".format(prefix)
+        m = shape[1]
 
         # when the variable is already set, i.e. passed externally, validate the shape
         # otherwise, create a new variable
-        W = getattr(self, weight_name, None)
+        W = getattr(self, name, None)
         if W is not None:
             # verify the shape
             shape = tuple(W.shape.as_list())
-            if shape != weight_shape:
+            if shape != shape:
                 raise ValueError("the shape of {} {} does not match {}".format(
-                    weight_name, shape, weight_shape))
+                    name, shape, shape))
         else:
             # define mean and stddev of weight init
             if isinstance(self.weight_init, tuple):
@@ -329,8 +351,8 @@ class LBN(object):
                 mean, stddev = 0., 1. / m
 
             # create and save the variable
-            W = tf.Variable(tf.random.normal(weight_shape, mean, stddev, dtype=tf.float32))
-            setattr(self, weight_name, W)
+            W = tf.Variable(tf.random.normal(shape, mean, stddev, dtype=tf.float32))
+            setattr(self, name, W)
 
     def build_constants(self):
         """
@@ -344,27 +366,21 @@ class LBN(object):
 
     def handle_input(self, inputs):
         """
-        Takes the passed four-vector *inputs* and infers dimensions and some internal tensors.
+        Takes the passed four-vector (and optionally auxiliary) *inputs* and infers dimensions and
+        some internal tensors.
         """
-        # inputs are expected to be four-vectors with the shape (batch, n_in, 4)
-        # convert them in case they have the shape (batch, 4 * n_in)
-        if len(inputs.shape) == 2 and inputs.shape[-1] % 4 == 0:
-            inputs = tf.reshape(inputs, (-1, inputs.shape[-1] // 4, 4))
-
         # store the input vectors
         self.inputs = inputs
 
-        # infer sizes
-        self.n_in = int(self.inputs.shape[1])
-        self.n_dim = int(self.inputs.shape[2])
-        if self.n_dim != 4:
-            raise Exception("input dimension must be 4 to represent 4-vectors")
+        # also store the four-vector components
+        self.inputs_E = self.inputs[..., 0]
+        self.inputs_px = self.inputs[..., 1]
+        self.inputs_py = self.inputs[..., 2]
+        self.inputs_pz = self.inputs[..., 3]
 
-        # split 4-vector components
-        names = ["E", "px", "py", "pz"]
-        split = [1, 1, 1, 1]
-        for t, name in zip(tf.split(self.inputs, split, axis=-1), names):
-            setattr(self, "inputs_" + name, tf.squeeze(t, -1))
+        # split auxiliary inputs
+        if self.n_aux > 0:
+            self.inputs_aux = self.inputs[..., 4:]
 
     def build_combinations(self, prefix):
         """
@@ -412,6 +428,18 @@ class LBN(object):
         setattr(self, name("{}s_pz"), pz)
         setattr(self, name("{}s_pvec"), p)
         setattr(self, name("{}s"), q)
+
+    def build_auxiliary(self):
+        """
+        Build combinations of auxiliary input features using the same approach as for particles and
+        restframes.
+        """
+        if self.n_aux <= 0:
+            raise Exception("cannot build auxiliary features when n_aux is not positive")
+
+        # build the features via a simple matmul
+        self.aux_features = tf.matmul(tf.reshape(self.inputs_aux, [-1, self.n_in * self.n_aux]),
+            self.aux_weights, name="aux_features")
 
     def build_boost(self):
         """
@@ -517,6 +545,10 @@ class LBN(object):
             if func is None:
                 raise ValueError("unknown feature '{}'".format(name))
             concat.append(func())
+
+        # add auxiliary features
+        if self.n_aux > 0:
+            concat.append(self.aux_features)
 
         # add external features
         if external_features is not None:

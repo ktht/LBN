@@ -39,6 +39,11 @@ class TestCase(unittest.TestCase):
         self.vectors = create_four_vectors((2, 10))
         self.vectors_t = tf.constant(self.vectors, dtype=tf.float32)
 
+        # create a version with auxiliary features
+        self.vectors_aux = np.random.uniform(-1., 1., (2, 10, 6))
+        self.vectors_aux[..., :4] = self.vectors
+        self.vectors_aux_t = tf.constant(self.vectors_aux, dtype=tf.float32)
+
         # common feature set
         self.feature_set = ["E", "pt", "eta", "phi", "m", "pair_cos"]
 
@@ -153,7 +158,7 @@ class TestCase(unittest.TestCase):
         # test wrong shape
         lbn = LBN(10, boost_mode=LBN.PAIRS, particle_weights=self.custom_particle_weights,
             restframe_weights=self.custom_restframe_weights[:-1])
-        with self.assertRaises(ValueError):
+        with self.assertRaises(Exception):
             lbn(self.vectors_t, features=self.feature_set).numpy()
 
     def test_boosting_pairs(self):
@@ -242,6 +247,19 @@ class TestCase(unittest.TestCase):
             return factory.px() + factory.py()
 
         self.assertIn("px_plus_py", lbn.available_features)
+
+    def test_aux_features(self):
+        lbn = LBN(10, boost_mode=LBN.PAIRS)
+
+        features = lbn(self.vectors_aux_t, features=self.feature_set).numpy()
+
+        self.assertEqual(lbn.n_dim, 6)
+        self.assertEqual(lbn.n_aux, 2)
+        self.assertEqual(lbn.n_auxiliaries, 10)
+        self.assertEqual(lbn.aux_weights.shape, (20, 10))
+
+        self.assertEqual(features.shape[1], lbn.n_features)
+        self.assertEqual(features.shape, (2, 105))
 
     def test_external_features(self):
         lbn = LBN(10, boost_mode=LBN.PAIRS)
@@ -344,10 +362,8 @@ class TestCase(unittest.TestCase):
         model = Model()
         output = model(self.vectors_t).numpy()
 
-        self.assertAlmostEqual(output[0, 0], 0 if PY3 else 1, 5)
-        self.assertAlmostEqual(output[0, 1], 1 if PY3 else 0, 5)
-        self.assertAlmostEqual(output[1, 0], 0 if PY3 else 1, 5)
-        self.assertAlmostEqual(output[1, 1], 1 if PY3 else 0, 5)
+        self.assertTrue(output[0, 0] < output[0, 1])
+        self.assertTrue(output[1, 0] < output[1, 1])
 
 
 def create_four_vectors(n, p_low=-100., p_high=100., m_low=0.1, m_high=50., seed=None):
