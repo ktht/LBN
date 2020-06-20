@@ -342,7 +342,7 @@ class LBN(object):
             seed = (self.seed + seed_offset) if self.seed is not None else None
 
             # create and save the variable
-            W = tf.Variable(tf.random.normal(shape, mean, stddev, dtype=tf.float32,
+            W = tf.Variable(tf.keras.backend.random_normal(shape, mean, stddev, dtype=tf.float32,
                 seed=seed), name=name, trainable=self.trainable)
             setattr(self, name, W)
 
@@ -901,7 +901,6 @@ class LBNLayer(tf.keras.layers.Layer):
         layer_kwargs = {
             "input_shape": input_shape,
             "dtype": kwargs.pop("dtype", None),
-            "dynamic": kwargs.pop("dynamic", False),
         }
         # for whatever reason, keras calls this contructor again
         # with batch_input_shape set when input_shape was accepted
